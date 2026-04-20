@@ -39,11 +39,43 @@ Eso implica que el solver no puede usar el patrón ingenuo:
 - `game.action = ...`
 - `game.step()`
 
-El siguiente paso debe ser investigar y utilizar correctamente alguno de estos caminos:
-- `perform_action(...)`
-- `handle_reset(...)`
-- `full_reset(...)`
-- u otro método runtime que cargue la acción antes de `step()`
+## Hallazgo runtime validado
+
+### Camino correcto para ejecutar acciones
+Se validó que el flujo correcto no es usar `game.action = ...`, sino llamar:
+- `perform_action(ActionInput(...))`
+
+Es decir, la clase real sí puede ejecutarse paso a paso, pero a través de `ActionInput`.
+
+### Resultado sobre nivel 0
+Después de `set_level(0)` se observó:
+- 1 solo par de nodos
+- score estructural inicial = `-15`
+- `len_a = 0`
+- `len_b = 3`
+- `gvtmoopqgy() = False`
+
+### Acciones simples repetidas
+Se probó `ACTION1` repetido varias veces.
+Hallazgo:
+- el nodo activo cambia de posición (`(11,36)` -> `(11,30)` -> `(11,24)` -> ... -> `(11,12)`)
+- luego queda trabado en esa posición
+- `segments` no cambia
+- `colors` no cambia
+- `len_a` sigue en `0`
+- `len_b` sigue en `3`
+
+### ACTION6 + 3 movimientos
+Se enumeraron los 2 targets válidos de `ACTION6` en nivel 0 y se probaron 54 secuencias válidas de:
+- `ACTION6`
+- seguido por 3 movimientos entre `ACTION1`, `ACTION3`, `ACTION4`
+
+Resultado:
+- 54 secuencias válidas
+- 0 errores
+- score siempre = `-15`
+- `gvtmoopqgy()` siempre = `False`
+- no hubo mejora estructural medible con el score actual
 
 ## Hipótesis fuerte
 `sk48` no es un entorno genérico de exploración, sino un puzzle de matching estructural entre pares de nodos y secuencias de segmentos.
@@ -105,6 +137,8 @@ Probar búsqueda limitada por profundidad, por ejemplo:
 3. Probar un agente solo para `sk48`, no general.
 
 4. Investigar el flujo correcto para inyectar acciones en la instancia real `Sk48` sin usar `game.action = ...`.
+
+5. Avanzar con un inspector estructural más profundo del nivel 0, porque ni el cambio de nodo ni los movimientos cortos están alterando `segments` o `colors` medidos.
 
 ## Decisión estratégica
 
