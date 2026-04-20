@@ -31,6 +31,20 @@ Solo entonces se activa `lgdrixfno`, se reproduce una animación y luego se ejec
 - `self.vjfbwggsd`: colores detectados por nodo
 - `gvtmoopqgy()`: compara colores entre nodos emparejados
 
+## Hallazgo nuevo importante
+
+La clase real `Sk48` es accesible directamente por import del archivo `sk48.py`, pero la propiedad `action` no tiene setter.
+
+Eso implica que el solver no puede usar el patrón ingenuo:
+- `game.action = ...`
+- `game.step()`
+
+El siguiente paso debe ser investigar y utilizar correctamente alguno de estos caminos:
+- `perform_action(...)`
+- `handle_reset(...)`
+- `full_reset(...)`
+- u otro método runtime que cargue la acción antes de `step()`
+
 ## Hipótesis fuerte
 `sk48` no es un entorno genérico de exploración, sino un puzzle de matching estructural entre pares de nodos y secuencias de segmentos.
 
@@ -89,6 +103,8 @@ Probar búsqueda limitada por profundidad, por ejemplo:
 2. Si no se puede, crear una versión local/independiente del solver que use directamente la lógica del archivo `sk48.py` como referencia.
 
 3. Probar un agente solo para `sk48`, no general.
+
+4. Investigar el flujo correcto para inyectar acciones en la instancia real `Sk48` sin usar `game.action = ...`.
 
 ## Decisión estratégica
 
