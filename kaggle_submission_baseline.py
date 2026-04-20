@@ -1,5 +1,6 @@
-import json
+import os
 
+import pandas as pd
 import arc_agi
 from arc_agi.base import OperationMode
 from arcengine import GameAction
@@ -12,11 +13,13 @@ MAX_STEPS = 200
 
 class BaselineAgent:
     def __init__(self):
+        # ligera mejora sin romper estabilidad
         self.actions = [
             GameAction.ACTION1,
+            GameAction.ACTION1,
+            GameAction.ACTION2,
             GameAction.ACTION2,
             GameAction.ACTION3,
-            GameAction.ACTION4,
         ]
 
     def act(self, step: int):
@@ -35,10 +38,31 @@ def run_game(game_id: str, max_steps: int = MAX_STEPS):
 
     frame = env.step(GameAction.RESET)
 
+    last_state = None
+    same_count = 0
     step = 0
+
     for step in range(max_steps):
+        if step % 50 == 0 and step > 0:
+            frame = env.step(GameAction.RESET)
+
         action = agent.act(step)
         frame = env.step(action)
+
+        try:
+            current_state = str(frame.frame)
+        except Exception:
+            current_state = None
+
+        if current_state == last_state:
+            same_count += 1
+        else:
+            same_count = 0
+
+        last_state = current_state
+
+        if same_count > 10:
+            break
 
         if frame.state.name in ["WIN", "GAME_OVER"]:
             break
@@ -69,8 +93,11 @@ def run_all_games(limit: int = MAX_GAMES):
 if __name__ == "__main__":
     results = run_all_games()
 
-    with open("/kaggle/working/submission.json", "w") as f:
-        json.dump(results, f)
+    df = pd.DataFrame(results)
+    output_path = "/kaggle/working/submission.parquet"
+    df.to_parquet(output_path, index=False)
 
-    print("submission.json generated")
-    print(results[:5])
+    print("submission.parquet generated")
+    print("Exists:", os.path.exists(output_path))
+    print("Size:", os.path.getsize(output_path))
+    print(df.head())
