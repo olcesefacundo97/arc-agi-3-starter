@@ -1,19 +1,15 @@
 # Kaggle Gateway Submission Baseline
 
-Este notebook sigue el flujo correcto observado en el sample oficial:
+Este notebook sigue el flujo correcto observado en el sample oficial.
 
-- En modo competencia (`KAGGLE_IS_COMPETITION_RERUN`):
-  - espera el gateway
-  - copia el repo oficial `ARC-AGI-3-Agents`
-  - inyecta un agente custom como `my_agent.py`
-  - sobrescribe `agents/__init__.py` para evitar imports opcionales pesados
-  - escribe `.env` apuntando al gateway
-  - ejecuta `python main.py --agent myagent`
+La versión actual usa un agente heurístico seguro:
+- respeta `available_actions`
+- aprende qué acciones suelen cambiar el frame
+- penaliza acciones que no producen cambios
+- usa `ACTION6` con coordenadas estructuradas solo cuando conviene explorar
+- mantiene el flujo oficial del gateway sin generar manualmente el parquet durante el rerun
 
-- Fuera de competencia:
-  - genera un `submission.parquet` dummy para que el notebook sea submitteable
-
-## Celda 1 — escribir agente custom mejorado
+## Celda 1 — escribir agente custom heuristic solver
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -26,31 +22,42 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Safe adaptive baseline agent.
+    """Gateway-safe heuristic solver baseline.
 
-    Objetivo:
-    - mantener el flujo oficial del gateway
-    - evitar dependencias pesadas
-    - usar available_actions cuando esté disponible
-    - combinar exploración simple con coordenadas estructuradas para ACTION6
+    Este agente no accede a estado interno del entorno.
+    Trabaja únicamente con la interfaz pública del gateway:
+    - latest_frame
+    - available_actions
+    - niveles completados
+    - cambios de frame observables
     """
 
-    MAX_ACTIONS = 120
+    MAX_ACTIONS = 160
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         seed = int(time.time() * 1000000) + hash(self.game_id) % 1000000
         random.seed(seed)
-        self.last_frame_repr = None
+
+        self.last_signature = None
+        self.last_action_key = None
         self.same_frame_count = 0
+        self.best_score_seen = -1
+
+        self.action_scores: dict[str, float] = {}
+        self.action_counts: dict[str, int] = {}
+        self.action_nochange: dict[str, int] = {}
+
         self.coord_index = 0
         self.coord_candidates = [
             (0, 0), (0, 63), (63, 0), (63, 63),
             (32, 32), (16, 16), (48, 48), (16, 48), (48, 16),
             (8, 8), (24, 24), (40, 40), (56, 56),
             (8, 56), (56, 8), (24, 40), (40, 24),
+            (13, 38), (22, 58), (11, 36), (20, 56),
         ]
-        self.simple_pattern = [
+
+        self.default_pattern = [
             GameAction.ACTION1,
             GameAction.ACTION2,
             GameAction.ACTION3,
@@ -63,7 +70,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.safe_adaptive.{self.MAX_ACTIONS}"
+        return f"{super().name}.heuristic_solver.{self.MAX_ACTIONS}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -79,24 +86,91 @@ class MyAgent(Agent):
                         pass
         return ids
 
-    def _is_available(self, action: GameAction, available_ids: set[int]) -> bool:
-        if not available_ids:
-            return action is not GameAction.RESET
-        return int(action.value) in available_ids
+    def _is_available(self, action: GameAction, ids: set[int]) -> bool:
+        if action is GameAction.RESET:
+            return False
+        if not ids:
+            return True
+        return int(action.value) in ids
+
+    def _frame_signature(self, latest_frame: FrameData) -> str:
+        try:
+            return str(latest_frame.frame[-1])[:2500]
+        except Exception:
+            try:
+                return str(latest_frame.frame)[:2500]
+            except Exception:
+                return "NO_FRAME"
+
+    def _score_value(self, latest_frame: FrameData) -> int:
+        try:
+            return int(getattr(latest_frame, "levels_completed", 0))
+        except Exception:
+            return 0
 
     def _next_coord(self) -> tuple[int, int]:
         coord = self.coord_candidates[self.coord_index % len(self.coord_candidates)]
         self.coord_index += 1
         return coord
 
-    def _frame_signature(self, latest_frame: FrameData) -> str:
+    def _key_for_action(self, action: GameAction) -> str:
         try:
-            return str(latest_frame.frame[-1])[:2000]
+            if action.is_complex():
+                return f"{int(action.value)}:complex"
+            return str(int(action.value))
         except Exception:
-            try:
-                return str(latest_frame.frame)[:2000]
-            except Exception:
-                return "NO_FRAME"
+            return str(action)
+
+    def _register_previous_outcome(self, latest_frame: FrameData) -> None:
+        signature = self._frame_signature(latest_frame)
+        score_now = self._score_value(latest_frame)
+
+        changed = self.last_signature is not None and signature != self.last_signature
+        score_improved = score_now > self.best_score_seen
+
+        if self.last_action_key is not None:
+            self.action_counts[self.last_action_key] = self.action_counts.get(self.last_action_key, 0) + 1
+
+            delta = 0.0
+            if changed:
+                delta += 1.0
+            else:
+                delta -= 0.35
+                self.action_nochange[self.last_action_key] = self.action_nochange.get(self.last_action_key, 0) + 1
+
+            if score_improved:
+                delta += 10.0
+
+            self.action_scores[self.last_action_key] = self.action_scores.get(self.last_action_key, 0.0) + delta
+
+        if signature == self.last_signature:
+            self.same_frame_count += 1
+        else:
+            self.same_frame_count = 0
+
+        self.last_signature = signature
+        if score_now > self.best_score_seen:
+            self.best_score_seen = score_now
+
+    def _rank_simple_actions(self, ids: set[int]) -> list[GameAction]:
+        candidates = []
+        for action in [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION7]:
+            if self._is_available(action, ids):
+                key = self._key_for_action(action)
+                score = self.action_scores.get(key, 0.0)
+                count = self.action_counts.get(key, 0)
+                nochange = self.action_nochange.get(key, 0)
+                exploration_bonus = 1.0 / (1.0 + count)
+                penalty = 0.15 * nochange
+                candidates.append((score + exploration_bonus - penalty, action))
+
+        if not candidates:
+            for action in self.default_pattern:
+                if self._is_available(action, ids):
+                    candidates.append((0.0, action))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [a for _, a in candidates]
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return any([
@@ -110,57 +184,36 @@ class MyAgent(Agent):
             action.reasoning = "Reset because game is not started or game over."
             return action
 
-        available_ids = self._available_action_ids(latest_frame)
+        self._register_previous_outcome(latest_frame)
+        ids = self._available_action_ids(latest_frame)
 
-        signature = self._frame_signature(latest_frame)
-        if signature == self.last_frame_repr:
-            self.same_frame_count += 1
-        else:
-            self.same_frame_count = 0
-        self.last_frame_repr = signature
-
-        # Si el frame parece estancado y ACTION6 está disponible, probar coordenadas estructuradas.
-        if self.same_frame_count >= 3 and self._is_available(GameAction.ACTION6, available_ids):
+        # Si estamos estancados, probar ACTION6 con coordenadas estructuradas si está disponible.
+        if self.same_frame_count >= 2 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "Frame appeared stagnant; trying structured ACTION6 coordinate.",
+                "my_reason": "Heuristic solver detected stagnation and is probing ACTION6 coordinates.",
             }
+            self.last_action_key = self._key_for_action(action)
             return action
 
-        # Priorizar patrón simple seguro respetando available_actions.
-        for offset in range(len(self.simple_pattern)):
-            idx = (self.action_counter + offset) % len(self.simple_pattern)
-            candidate = self.simple_pattern[idx]
-            if self._is_available(candidate, available_ids):
-                candidate.reasoning = f"Safe adaptive pattern picked {candidate.value}"
-                return candidate
-
-        # Fallback: elegir cualquier acción disponible excepto RESET.
-        candidates = []
-        for a in GameAction:
-            if a is GameAction.RESET:
-                continue
-            if self._is_available(a, available_ids):
-                candidates.append(a)
-
-        if not candidates:
-            action = GameAction.RESET
-            action.reasoning = "Fallback reset because no candidates were available."
+        ranked = self._rank_simple_actions(ids)
+        if ranked:
+            # Mezclar explotación y exploración para no casarse con una acción mediocre.
+            if random.random() < 0.78:
+                action = ranked[0]
+            else:
+                action = random.choice(ranked[: min(3, len(ranked))])
+            action.reasoning = f"Heuristic ranked action {action.value}"
+            self.last_action_key = self._key_for_action(action)
             return action
 
-        action = random.choice(candidates)
-        if action.is_simple():
-            action.reasoning = f"Fallback picked {action.value}"
-        elif action.is_complex():
-            x, y = self._next_coord()
-            action.set_data({"x": int(x), "y": int(y)})
-            action.reasoning = {
-                "desired_action": f"{action.value}",
-                "my_reason": "Fallback structured coordinate action.",
-            }
+        # Fallback defensivo.
+        action = GameAction.RESET
+        action.reasoning = "No valid ranked actions; fallback reset."
+        self.last_action_key = None
         return action
 ```
 
