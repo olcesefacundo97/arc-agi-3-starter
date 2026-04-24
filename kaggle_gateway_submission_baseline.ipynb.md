@@ -2,16 +2,15 @@
 
 Este notebook sigue el flujo correcto observado en el sample oficial.
 
-La versión actual usa un agente **online beam + memoria por estado**:
+La versión actual usa un agente **online beam + memoria por estado + memoria de secuencias**:
 - mantiene el flujo oficial del gateway
 - respeta `available_actions`
 - no genera manualmente `submission.parquet` durante el rerun
-- aprende qué acciones producen cambios observables
-- mantiene un beam de candidatas
-- recuerda qué acción funcionó mejor para firmas de estado vistas antes
+- aprende acciones y secuencias cortas que producen cambios observables
+- reutiliza secuencias exitosas cuando vuelve a estados similares
 - usa `ACTION6` con coordenadas estructuradas ante estancamiento
 
-## Celda 1 — escribir agente custom con memoria por estado
+## Celda 1 — escribir agente custom con memoria de secuencias
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -24,18 +23,19 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Gateway-safe online beam agent with state memory.
+    """Gateway-safe online beam agent with state and sequence memory.
 
-    No simula ramas reales, pero aprende online:
-    - score global por acción
-    - memoria local estado -> acción
-    - penalización por acciones que no cambian el frame
-    - uso controlado de ACTION6 ante estancamiento
+    Aprende online sin usar internals:
+    - acción -> resultado
+    - estado -> acción buena
+    - estado -> secuencia buena
+    - penalización por no-cambio
     """
 
-    MAX_ACTIONS = 190
+    MAX_ACTIONS = 210
     BEAM_WIDTH = 3
-    MEMORY_LIMIT = 600
+    MEMORY_LIMIT = 700
+    SEQUENCE_MAX_LEN = 3
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -53,10 +53,13 @@ class MyAgent(Agent):
         self.action_counts: dict[str, int] = {}
         self.action_nochange: dict[str, int] = {}
         self.recent_actions: list[str] = []
+        self.recent_contexts: list[tuple[str, str]] = []
 
-        # state memory: memory_key -> action_key -> value
         self.state_memory: dict[str, dict[str, float]] = {}
+        self.state_sequence_memory: dict[str, dict[tuple[str, ...], float]] = {}
         self.state_hits: dict[str, int] = {}
+
+        self.active_sequence: list[str] = []
 
         self.coord_index = 0
         self.coord_candidates = [
@@ -83,7 +86,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.beam_memory.{self.MAX_ACTIONS}.k{self.BEAM_WIDTH}"
+        return f"{super().name}.seq_memory.{self.MAX_ACTIONS}.k{self.BEAM_WIDTH}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -116,7 +119,6 @@ class MyAgent(Agent):
                 return "NO_FRAME"
 
     def _memory_key_from_signature(self, signature: str) -> str:
-        # Coarse key: enough to recognize repeated states without storing huge frames.
         return str(hash(signature[:1200]))
 
     def _score_value(self, latest_frame: FrameData) -> int:
@@ -153,10 +155,10 @@ class MyAgent(Agent):
     def _trim_memory(self) -> None:
         if len(self.state_memory) <= self.MEMORY_LIMIT:
             return
-        # Remove least-hit states.
         ordered = sorted(self.state_hits.items(), key=lambda kv: kv[1])
         for key, _ in ordered[: max(1, len(ordered) - self.MEMORY_LIMIT)]:
             self.state_memory.pop(key, None)
+            self.state_sequence_memory.pop(key, None)
             self.state_hits.pop(key, None)
 
     def _update_state_memory(self, memory_key: str | None, action_key: str | None, reward_delta: float) -> None:
@@ -167,6 +169,21 @@ class MyAgent(Agent):
         self.state_memory[memory_key][action_key] = self.state_memory[memory_key].get(action_key, 0.0) + reward_delta
         self.state_hits[memory_key] = self.state_hits.get(memory_key, 0) + 1
         self._trim_memory()
+
+    def _update_sequence_memory(self, reward_delta: float) -> None:
+        # Reward recent action sequences that led to this outcome.
+        if reward_delta == 0 or len(self.recent_contexts) < 2:
+            return
+        max_len = min(self.SEQUENCE_MAX_LEN, len(self.recent_contexts))
+        for length in range(2, max_len + 1):
+            window = self.recent_contexts[-length:]
+            start_state = window[0][0]
+            seq = tuple(action_key for _, action_key in window)
+            if start_state not in self.state_sequence_memory:
+                self.state_sequence_memory[start_state] = {}
+            # shorter sequences are a little more reliable
+            scaled = reward_delta / float(length)
+            self.state_sequence_memory[start_state][seq] = self.state_sequence_memory[start_state].get(seq, 0.0) + scaled
 
     def _register_previous_outcome(self, latest_frame: FrameData) -> tuple[str, str]:
         signature = self._frame_signature(latest_frame)
@@ -195,6 +212,7 @@ class MyAgent(Agent):
                 self.action_nochange[self.last_action_key] = self.action_nochange.get(self.last_action_key, 0) + 1
             self.action_scores[self.last_action_key] = self.action_scores.get(self.last_action_key, 0.0) + reward_delta
             self._update_state_memory(self.last_memory_key, self.last_action_key, reward_delta)
+            self._update_sequence_memory(reward_delta)
 
         if signature == self.last_signature:
             self.same_frame_count += 1
@@ -225,22 +243,17 @@ class MyAgent(Agent):
     def _rank_actions(self, ids: set[int], memory_key: str) -> list[GameAction]:
         ranked = []
         local_memory = self.state_memory.get(memory_key, {})
-
         for action in self._candidate_actions(ids):
             key = self._key_for_action(action)
             global_score = self.action_scores.get(key, 0.0)
             local_score = local_memory.get(key, 0.0)
             count = self.action_counts.get(key, 0)
             nochange = self.action_nochange.get(key, 0)
-
             exploration_bonus = 1.25 / (1.0 + count)
             nochange_penalty = 0.20 * nochange
             repetition_penalty = 0.35 if self.recent_actions[-3:].count(key) >= 2 else 0.0
-
-            # local memory is strong, but not absolute.
             value = global_score + 1.75 * local_score + exploration_bonus - nochange_penalty - repetition_penalty
             ranked.append((value, action))
-
         ranked.sort(key=lambda x: x[0], reverse=True)
         return [a for _, a in ranked]
 
@@ -257,20 +270,47 @@ class MyAgent(Agent):
                 return action
         return None
 
-    def _beam_pick(self, ranked: list[GameAction], memory_action: GameAction | None) -> GameAction:
-        if memory_action is not None and random.random() < 0.62:
-            return memory_action
+    def _sequence_for_state(self, ids: set[int], memory_key: str) -> list[str]:
+        seq_memory = self.state_sequence_memory.get(memory_key, {})
+        if not seq_memory:
+            return []
+        sorted_items = sorted(seq_memory.items(), key=lambda kv: kv[1], reverse=True)
+        for seq, value in sorted_items[:5]:
+            if value <= 0:
+                continue
+            valid = True
+            for action_key in seq:
+                action = self._action_from_key(action_key)
+                if action is None or not self._is_available(action, ids):
+                    valid = False
+                    break
+            if valid:
+                return list(seq)
+        return []
 
+    def _beam_pick(self, ranked: list[GameAction], memory_action: GameAction | None) -> GameAction:
+        if memory_action is not None and random.random() < 0.52:
+            return memory_action
         if not ranked:
             return GameAction.RESET
-
         beam = ranked[: self.BEAM_WIDTH]
         r = random.random()
-        if r < 0.64:
+        if r < 0.62:
             return beam[0]
         if r < 0.90:
             return random.choice(beam)
         return random.choice(ranked)
+
+    def _record_chosen_action(self, memory_key: str, action: GameAction) -> None:
+        self.last_action_key = self._key_for_action(action)
+        self.last_memory_key = memory_key
+        self.recent_actions.append(self.last_action_key)
+        self.recent_actions = self.recent_actions[-10:]
+        self.recent_contexts.append((memory_key, self.last_action_key))
+        self.recent_contexts = self.recent_contexts[-8:]
+
+    def _action_from_sequence_key(self, action_key: str) -> GameAction | None:
+        return self._action_from_key(action_key)
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return any([
@@ -280,6 +320,7 @@ class MyAgent(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            self.active_sequence = []
             action = GameAction.RESET
             action.reasoning = "Reset because game is not started or game over."
             return action
@@ -287,18 +328,37 @@ class MyAgent(Agent):
         _, memory_key = self._register_previous_outcome(latest_frame)
         ids = self._available_action_ids(latest_frame)
 
+        # Continue active remembered sequence if possible.
+        while self.active_sequence:
+            next_key = self.active_sequence.pop(0)
+            seq_action = self._action_from_sequence_key(next_key)
+            if seq_action is not None and self._is_available(seq_action, ids):
+                seq_action.reasoning = f"Continuing learned sequence with action {seq_action.value}."
+                self._record_chosen_action(memory_key, seq_action)
+                return seq_action
+
+        # Retrieve a good sequence for this state.
+        if random.random() < 0.45:
+            seq = self._sequence_for_state(ids, memory_key)
+            if seq:
+                first_key = seq.pop(0)
+                self.active_sequence = seq
+                action = self._action_from_sequence_key(first_key)
+                if action is not None and self._is_available(action, ids):
+                    action.reasoning = f"Starting learned sequence with action {action.value}."
+                    self._record_chosen_action(memory_key, action)
+                    return action
+
+        # Stagnation branch: use ACTION6 coordinate probe.
         if self.same_frame_count >= 2 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "Beam memory detected stagnation; probing structured ACTION6 coordinate.",
+                "my_reason": "Sequence memory detected stagnation; probing structured ACTION6 coordinate.",
             }
-            self.last_action_key = self._key_for_action(action)
-            self.last_memory_key = memory_key
-            self.recent_actions.append(self.last_action_key)
-            self.recent_actions = self.recent_actions[-10:]
+            self._record_chosen_action(memory_key, action)
             return action
 
         memory_action = self._memory_action(ids, memory_key)
@@ -306,16 +366,13 @@ class MyAgent(Agent):
         action = self._beam_pick(ranked, memory_action)
 
         if action is GameAction.RESET:
-            action.reasoning = "Fallback reset from empty beam memory."
+            action.reasoning = "Fallback reset from empty sequence memory."
             self.last_action_key = None
             self.last_memory_key = memory_key
             return action
 
-        action.reasoning = f"Beam memory picked {action.value}."
-        self.last_action_key = self._key_for_action(action)
-        self.last_memory_key = memory_key
-        self.recent_actions.append(self.last_action_key)
-        self.recent_actions = self.recent_actions[-10:]
+        action.reasoning = f"Sequence memory picked {action.value}."
+        self._record_chosen_action(memory_key, action)
         return action
 ```
 
