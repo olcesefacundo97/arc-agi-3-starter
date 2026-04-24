@@ -2,17 +2,18 @@
 
 Este notebook sigue el flujo correcto observado en el sample oficial.
 
-La versión actual usa un agente **sequence memory + política específica para sk48 con matching visual de pares**:
+La versión actual usa un agente **sequence memory + política específica para sk48 con matching visual de pares y scoring estructural**:
 - mantiene el flujo oficial del gateway
 - respeta `available_actions`
 - no genera manualmente `submission.parquet` durante el rerun
 - usa una política especial para juegos `sk48*`
 - detecta componentes conectados en el frame
 - empareja componentes similares por color/tamaño/forma aproximada
-- usa centros de pares como coordenadas candidatas para `ACTION6`
+- puntúa pares por similitud, separación, tamaño y centralidad
+- usa centros de pares de mayor score como coordenadas candidatas para `ACTION6`
 - para el resto, conserva memoria de acciones/secuencias
 
-## Celda 1 — escribir agente custom con matching de pares para sk48
+## Celda 1 — escribir agente custom con scoring estructural sk48
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -25,9 +26,9 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Gateway-safe agent with sk48 visual pair matching and generic sequence memory fallback."""
+    """Gateway-safe agent with sk48 structural pair scoring and generic sequence memory fallback."""
 
-    MAX_ACTIONS = 230
+    MAX_ACTIONS = 235
     BEAM_WIDTH = 3
     MEMORY_LIMIT = 700
     SEQUENCE_MAX_LEN = 3
@@ -78,7 +79,7 @@ class MyAgent(Agent):
             GameAction.ACTION4,
             GameAction.ACTION2,
         ]
-        self.sk48_probe_every = 6
+        self.sk48_probe_every = 5
 
         self.bootstrap_pattern = [
             GameAction.ACTION1,
@@ -95,7 +96,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.sk48_pair_match_seq.{self.MAX_ACTIONS}"
+        return f"{super().name}.sk48_struct_score_seq.{self.MAX_ACTIONS}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -142,11 +143,6 @@ class MyAgent(Agent):
         return max(counts.items(), key=lambda kv: kv[1])[0]
 
     def _connected_components(self, latest_frame: FrameData) -> list[dict[str, int]]:
-        """Small connected-component extractor for 64x64 frames.
-
-        Components are grouped by same color with 4-neighborhood.
-        No numpy; safe for gateway.
-        """
         grid = self._latest_grid(latest_frame)
         if grid is None:
             return []
@@ -225,32 +221,48 @@ class MyAgent(Agent):
             + abs(a["h"] - b["h"]) * 1.2
         )
 
+    def _pair_structural_score(self, a: dict[str, int], b: dict[str, int]) -> float:
+        similarity = self._pair_distance(a, b)
+        spatial = abs(a["cx"] - b["cx"]) + abs(a["cy"] - b["cy"])
+        size = a["count"] + b["count"]
+        center_bias = abs(((a["cx"] + b["cx"]) / 2) - 32) + abs(((a["cy"] + b["cy"]) / 2) - 32)
+
+        if spatial < 6:
+            return -999.0
+        if size < 8:
+            return -999.0
+
+        # Higher is better: very similar pair, separated enough, not too huge, reasonably central.
+        score = 40.0
+        score -= similarity * 2.5
+        score += min(spatial, 40) * 0.18
+        score -= max(0, size - 80) * 0.03
+        score -= center_bias * 0.04
+        return score
+
     def _detect_pair_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
         comps = self._connected_components(latest_frame)
         if not comps:
             return []
 
-        pairs: list[tuple[float, dict[str, int], dict[str, int]]] = []
+        scored_pairs: list[tuple[float, dict[str, int], dict[str, int]]] = []
         for i in range(len(comps)):
             for j in range(i + 1, len(comps)):
                 a = comps[i]
                 b = comps[j]
-                # Favor same-color/similar-shape components separated enough to plausibly be pairs.
-                spatial = abs(a["cx"] - b["cx"]) + abs(a["cy"] - b["cy"])
-                if spatial < 6:
-                    continue
-                d = self._pair_distance(a, b)
-                if d <= 8.5:
-                    # slightly prefer medium/small structural components
-                    size_penalty = 0.01 * (a["count"] + b["count"])
-                    pairs.append((d + size_penalty, a, b))
+                score = self._pair_structural_score(a, b)
+                if score > 15.0:
+                    scored_pairs.append((score, a, b))
 
-        pairs.sort(key=lambda t: t[0])
+        scored_pairs.sort(key=lambda t: t[0], reverse=True)
 
         coords: list[tuple[int, int]] = []
         seen = set()
-        for _, a, b in pairs[:8]:
-            for p in ((a["cx"], a["cy"]), (b["cx"], b["cy"])):
+        for _, a, b in scored_pairs[:8]:
+            # Prefer the smaller/active-looking component first, then its pair.
+            ordered = (a, b) if a["count"] <= b["count"] else (b, a)
+            for c in ordered:
+                p = (c["cx"], c["cy"])
                 if p not in seen:
                     coords.append(p)
                     seen.add(p)
@@ -258,7 +270,8 @@ class MyAgent(Agent):
 
     def _detect_visual_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
         comps = self._connected_components(latest_frame)
-        centers = [(c["cx"], c["cy"]) for c in comps if 4 <= c["count"] <= 400]
+        # Prefer actionable component sizes.
+        centers = [(c["cx"], c["cy"]) for c in comps if 4 <= c["count"] <= 180]
         centers = sorted(set(centers), key=lambda p: (abs(p[0] - 32) + abs(p[1] - 32), p[1], p[0]))
         return centers[:12]
 
@@ -275,7 +288,7 @@ class MyAgent(Agent):
                 seen.add(p)
         if merged:
             self.pair_coord_candidates = pair_centers
-            self.dynamic_coord_candidates = merged[:36]
+            self.dynamic_coord_candidates = merged[:40]
 
     def _frame_signature(self, latest_frame: FrameData) -> str:
         try:
@@ -481,20 +494,20 @@ class MyAgent(Agent):
 
         self._refresh_dynamic_coords(latest_frame)
 
-        # Probe ACTION6 more intelligently using paired component centers when available.
+        # Probe ACTION6 using top-scored pair centers when available.
         if self.action_counter > 0 and self.action_counter % self.sk48_probe_every == 0 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "sk48 pair-matching branch probing ACTION6 coordinate.",
+                "my_reason": "sk48 structural-scoring branch probing top pair coordinate.",
             }
             return action
 
         candidate = self.sk48_plan[self.action_counter % len(self.sk48_plan)]
         if self._is_available(candidate, ids):
-            candidate.reasoning = f"sk48 pair structural policy picked {candidate.value}."
+            candidate.reasoning = f"sk48 structural-scored policy picked {candidate.value}."
             return candidate
 
         ranked = self._rank_actions(ids, memory_key)
