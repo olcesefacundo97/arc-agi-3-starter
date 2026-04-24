@@ -2,15 +2,17 @@
 
 Este notebook sigue el flujo correcto observado en el sample oficial.
 
-La versión actual usa un agente **sequence memory + política específica para sk48 con detección visual simple de pares**:
+La versión actual usa un agente **sequence memory + política específica para sk48 con matching visual de pares**:
 - mantiene el flujo oficial del gateway
 - respeta `available_actions`
 - no genera manualmente `submission.parquet` durante el rerun
 - usa una política especial para juegos `sk48*`
-- detecta clusters visuales simples y usa sus centros como coordenadas candidatas
+- detecta componentes conectados en el frame
+- empareja componentes similares por color/tamaño/forma aproximada
+- usa centros de pares como coordenadas candidatas para `ACTION6`
 - para el resto, conserva memoria de acciones/secuencias
 
-## Celda 1 — escribir agente custom con política específica sk48 + detección de pares
+## Celda 1 — escribir agente custom con matching de pares para sk48
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -23,9 +25,9 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Gateway-safe agent with sk48-specific visual pair detection and generic sequence memory fallback."""
+    """Gateway-safe agent with sk48 visual pair matching and generic sequence memory fallback."""
 
-    MAX_ACTIONS = 220
+    MAX_ACTIONS = 230
     BEAM_WIDTH = 3
     MEMORY_LIMIT = 700
     SEQUENCE_MAX_LEN = 3
@@ -56,6 +58,7 @@ class MyAgent(Agent):
 
         self.coord_index = 0
         self.dynamic_coord_candidates: list[tuple[int, int]] = []
+        self.pair_coord_candidates: list[tuple[int, int]] = []
         self.coord_candidates = [
             (0, 0), (0, 63), (63, 0), (63, 63),
             (32, 32), (16, 16), (48, 48), (16, 48), (48, 16),
@@ -75,7 +78,7 @@ class MyAgent(Agent):
             GameAction.ACTION4,
             GameAction.ACTION2,
         ]
-        self.sk48_probe_every = 8
+        self.sk48_probe_every = 6
 
         self.bootstrap_pattern = [
             GameAction.ACTION1,
@@ -92,7 +95,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.sk48_visual_pair_seq.{self.MAX_ACTIONS}"
+        return f"{super().name}.sk48_pair_match_seq.{self.MAX_ACTIONS}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -124,16 +127,7 @@ class MyAgent(Agent):
             pass
         return None
 
-    def _detect_visual_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
-        """Very light visual clustering without numpy.
-
-        Finds bounding boxes for repeated non-background colors and returns centers.
-        This is intentionally simple and safe for gateway execution.
-        """
-        grid = self._latest_grid(latest_frame)
-        if grid is None:
-            return []
-
+    def _background_color(self, grid) -> int | None:
         counts: dict[int, int] = {}
         for y in range(64):
             row = grid[y]
@@ -143,59 +137,145 @@ class MyAgent(Agent):
                 except Exception:
                     continue
                 counts[c] = counts.get(c, 0) + 1
-
         if not counts:
-            return []
-        background = max(counts.items(), key=lambda kv: kv[1])[0]
+            return None
+        return max(counts.items(), key=lambda kv: kv[1])[0]
 
-        boxes: dict[int, list[int]] = {}
-        for y in range(64):
-            row = grid[y]
-            for x in range(64):
+    def _connected_components(self, latest_frame: FrameData) -> list[dict[str, int]]:
+        """Small connected-component extractor for 64x64 frames.
+
+        Components are grouped by same color with 4-neighborhood.
+        No numpy; safe for gateway.
+        """
+        grid = self._latest_grid(latest_frame)
+        if grid is None:
+            return []
+        bg = self._background_color(grid)
+        if bg is None:
+            return []
+
+        visited = [[False for _ in range(64)] for _ in range(64)]
+        comps: list[dict[str, int]] = []
+
+        for sy in range(64):
+            for sx in range(64):
+                if visited[sy][sx]:
+                    continue
+                visited[sy][sx] = True
                 try:
-                    c = int(row[x])
+                    color = int(grid[sy][sx])
                 except Exception:
                     continue
-                if c == background:
+                if color == bg:
                     continue
-                # Ignore very dominant UI/noise-ish colors.
-                if counts.get(c, 0) > 900:
+
+                stack = [(sx, sy)]
+                minx = maxx = sx
+                miny = maxy = sy
+                count = 0
+
+                while stack:
+                    x, y = stack.pop()
+                    count += 1
+                    if x < minx: minx = x
+                    if x > maxx: maxx = x
+                    if y < miny: miny = y
+                    if y > maxy: maxy = y
+
+                    for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                        if nx < 0 or nx >= 64 or ny < 0 or ny >= 64:
+                            continue
+                        if visited[ny][nx]:
+                            continue
+                        visited[ny][nx] = True
+                        try:
+                            nc = int(grid[ny][nx])
+                        except Exception:
+                            continue
+                        if nc == color:
+                            stack.append((nx, ny))
+
+                if count < 4:
                     continue
-                if c not in boxes:
-                    boxes[c] = [x, y, x, y, 0]
-                b = boxes[c]
-                b[0] = min(b[0], x)
-                b[1] = min(b[1], y)
-                b[2] = max(b[2], x)
-                b[3] = max(b[3], y)
-                b[4] += 1
+                w = maxx - minx + 1
+                h = maxy - miny + 1
+                if w > 45 or h > 45:
+                    continue
 
-        centers: list[tuple[int, int]] = []
-        for c, (minx, miny, maxx, maxy, n) in boxes.items():
-            if n < 4:
-                continue
-            if maxx - minx > 50 and maxy - miny > 50:
-                continue
-            cx = int((minx + maxx) / 2)
-            cy = int((miny + maxy) / 2)
-            centers.append((cx, cy))
+                comps.append({
+                    "color": color,
+                    "count": count,
+                    "minx": minx,
+                    "miny": miny,
+                    "maxx": maxx,
+                    "maxy": maxy,
+                    "w": w,
+                    "h": h,
+                    "cx": int((minx + maxx) / 2),
+                    "cy": int((miny + maxy) / 2),
+                })
 
-        # Prefer centers away from extreme borders and then add fallback anchors.
+        return comps[:80]
+
+    def _pair_distance(self, a: dict[str, int], b: dict[str, int]) -> float:
+        return (
+            abs(a["color"] - b["color"]) * 2.0
+            + abs(a["count"] - b["count"]) * 0.25
+            + abs(a["w"] - b["w"]) * 1.2
+            + abs(a["h"] - b["h"]) * 1.2
+        )
+
+    def _detect_pair_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
+        comps = self._connected_components(latest_frame)
+        if not comps:
+            return []
+
+        pairs: list[tuple[float, dict[str, int], dict[str, int]]] = []
+        for i in range(len(comps)):
+            for j in range(i + 1, len(comps)):
+                a = comps[i]
+                b = comps[j]
+                # Favor same-color/similar-shape components separated enough to plausibly be pairs.
+                spatial = abs(a["cx"] - b["cx"]) + abs(a["cy"] - b["cy"])
+                if spatial < 6:
+                    continue
+                d = self._pair_distance(a, b)
+                if d <= 8.5:
+                    # slightly prefer medium/small structural components
+                    size_penalty = 0.01 * (a["count"] + b["count"])
+                    pairs.append((d + size_penalty, a, b))
+
+        pairs.sort(key=lambda t: t[0])
+
+        coords: list[tuple[int, int]] = []
+        seen = set()
+        for _, a, b in pairs[:8]:
+            for p in ((a["cx"], a["cy"]), (b["cx"], b["cy"])):
+                if p not in seen:
+                    coords.append(p)
+                    seen.add(p)
+        return coords[:16]
+
+    def _detect_visual_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
+        comps = self._connected_components(latest_frame)
+        centers = [(c["cx"], c["cy"]) for c in comps if 4 <= c["count"] <= 400]
         centers = sorted(set(centers), key=lambda p: (abs(p[0] - 32) + abs(p[1] - 32), p[1], p[0]))
         return centers[:12]
 
     def _refresh_dynamic_coords(self, latest_frame: FrameData) -> None:
         if not str(self.game_id).startswith("sk48"):
             return
-        centers = self._detect_visual_centers(latest_frame)
-        if centers:
-            merged = []
-            seen = set()
-            for p in centers + self.coord_candidates:
-                if p not in seen:
-                    merged.append(p)
-                    seen.add(p)
-            self.dynamic_coord_candidates = merged[:30]
+        pair_centers = self._detect_pair_centers(latest_frame)
+        visual_centers = self._detect_visual_centers(latest_frame)
+        merged = []
+        seen = set()
+        for p in pair_centers + visual_centers + self.coord_candidates:
+            if p not in seen:
+                merged.append(p)
+                seen.add(p)
+        if merged:
+            self.pair_coord_candidates = pair_centers
+            self.dynamic_coord_candidates = merged[:36]
 
     def _frame_signature(self, latest_frame: FrameData) -> str:
         try:
@@ -216,7 +296,10 @@ class MyAgent(Agent):
             return 0
 
     def _next_coord(self) -> tuple[int, int]:
-        pool = self.dynamic_coord_candidates if self.dynamic_coord_candidates else self.coord_candidates
+        if self.pair_coord_candidates and self.coord_index % 2 == 0:
+            pool = self.pair_coord_candidates
+        else:
+            pool = self.dynamic_coord_candidates if self.dynamic_coord_candidates else self.coord_candidates
         coord = pool[self.coord_index % len(pool)]
         self.coord_index += 1
         return coord
@@ -398,20 +481,20 @@ class MyAgent(Agent):
 
         self._refresh_dynamic_coords(latest_frame)
 
-        # Probe ACTION6 more intelligently using visual centers when available.
+        # Probe ACTION6 more intelligently using paired component centers when available.
         if self.action_counter > 0 and self.action_counter % self.sk48_probe_every == 0 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "sk48 visual-pair branch probing ACTION6 coordinate.",
+                "my_reason": "sk48 pair-matching branch probing ACTION6 coordinate.",
             }
             return action
 
         candidate = self.sk48_plan[self.action_counter % len(self.sk48_plan)]
         if self._is_available(candidate, ids):
-            candidate.reasoning = f"sk48 visual structural policy picked {candidate.value}."
+            candidate.reasoning = f"sk48 pair structural policy picked {candidate.value}."
             return candidate
 
         ranked = self._rank_actions(ids, memory_key)
