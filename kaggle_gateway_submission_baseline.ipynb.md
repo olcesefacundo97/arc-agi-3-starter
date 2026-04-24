@@ -2,14 +2,15 @@
 
 Este notebook sigue el flujo correcto observado en el sample oficial.
 
-La versión actual usa un agente **sequence memory + política específica para sk48**:
+La versión actual usa un agente **sequence memory + política específica para sk48 con detección visual simple de pares**:
 - mantiene el flujo oficial del gateway
 - respeta `available_actions`
 - no genera manualmente `submission.parquet` durante el rerun
 - usa una política especial para juegos `sk48*`
+- detecta clusters visuales simples y usa sus centros como coordenadas candidatas
 - para el resto, conserva memoria de acciones/secuencias
 
-## Celda 1 — escribir agente custom con política específica sk48
+## Celda 1 — escribir agente custom con política específica sk48 + detección de pares
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -22,7 +23,7 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Gateway-safe agent with sk48-specific branch and generic sequence memory fallback."""
+    """Gateway-safe agent with sk48-specific visual pair detection and generic sequence memory fallback."""
 
     MAX_ACTIONS = 220
     BEAM_WIDTH = 3
@@ -54,6 +55,7 @@ class MyAgent(Agent):
         self.active_sequence: list[str] = []
 
         self.coord_index = 0
+        self.dynamic_coord_candidates: list[tuple[int, int]] = []
         self.coord_candidates = [
             (0, 0), (0, 63), (63, 0), (63, 63),
             (32, 32), (16, 16), (48, 48), (16, 48), (48, 16),
@@ -63,9 +65,6 @@ class MyAgent(Agent):
             (31, 31), (32, 31), (31, 32), (33, 33),
         ]
 
-        # sk48: basado en investigación offline:
-        # ACTION1/ACTION2 desplazan verticalmente; ACTION3/ACTION4 alteran estructura local;
-        # ACTION6 requiere coordenadas y puede ser importante, pero se usa con cuidado.
         self.sk48_plan = [
             GameAction.ACTION1, GameAction.ACTION1, GameAction.ACTION1, GameAction.ACTION1,
             GameAction.ACTION3,
@@ -76,7 +75,7 @@ class MyAgent(Agent):
             GameAction.ACTION4,
             GameAction.ACTION2,
         ]
-        self.sk48_probe_every = 10
+        self.sk48_probe_every = 8
 
         self.bootstrap_pattern = [
             GameAction.ACTION1,
@@ -93,7 +92,7 @@ class MyAgent(Agent):
 
     @property
     def name(self) -> str:
-        return f"{super().name}.sk48_seq_memory.{self.MAX_ACTIONS}"
+        return f"{super().name}.sk48_visual_pair_seq.{self.MAX_ACTIONS}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -116,6 +115,88 @@ class MyAgent(Agent):
             return True
         return int(action.value) in ids
 
+    def _latest_grid(self, latest_frame: FrameData):
+        try:
+            frame = latest_frame.frame[-1]
+            if len(frame) == 64 and len(frame[0]) == 64:
+                return frame
+        except Exception:
+            pass
+        return None
+
+    def _detect_visual_centers(self, latest_frame: FrameData) -> list[tuple[int, int]]:
+        """Very light visual clustering without numpy.
+
+        Finds bounding boxes for repeated non-background colors and returns centers.
+        This is intentionally simple and safe for gateway execution.
+        """
+        grid = self._latest_grid(latest_frame)
+        if grid is None:
+            return []
+
+        counts: dict[int, int] = {}
+        for y in range(64):
+            row = grid[y]
+            for x in range(64):
+                try:
+                    c = int(row[x])
+                except Exception:
+                    continue
+                counts[c] = counts.get(c, 0) + 1
+
+        if not counts:
+            return []
+        background = max(counts.items(), key=lambda kv: kv[1])[0]
+
+        boxes: dict[int, list[int]] = {}
+        for y in range(64):
+            row = grid[y]
+            for x in range(64):
+                try:
+                    c = int(row[x])
+                except Exception:
+                    continue
+                if c == background:
+                    continue
+                # Ignore very dominant UI/noise-ish colors.
+                if counts.get(c, 0) > 900:
+                    continue
+                if c not in boxes:
+                    boxes[c] = [x, y, x, y, 0]
+                b = boxes[c]
+                b[0] = min(b[0], x)
+                b[1] = min(b[1], y)
+                b[2] = max(b[2], x)
+                b[3] = max(b[3], y)
+                b[4] += 1
+
+        centers: list[tuple[int, int]] = []
+        for c, (minx, miny, maxx, maxy, n) in boxes.items():
+            if n < 4:
+                continue
+            if maxx - minx > 50 and maxy - miny > 50:
+                continue
+            cx = int((minx + maxx) / 2)
+            cy = int((miny + maxy) / 2)
+            centers.append((cx, cy))
+
+        # Prefer centers away from extreme borders and then add fallback anchors.
+        centers = sorted(set(centers), key=lambda p: (abs(p[0] - 32) + abs(p[1] - 32), p[1], p[0]))
+        return centers[:12]
+
+    def _refresh_dynamic_coords(self, latest_frame: FrameData) -> None:
+        if not str(self.game_id).startswith("sk48"):
+            return
+        centers = self._detect_visual_centers(latest_frame)
+        if centers:
+            merged = []
+            seen = set()
+            for p in centers + self.coord_candidates:
+                if p not in seen:
+                    merged.append(p)
+                    seen.add(p)
+            self.dynamic_coord_candidates = merged[:30]
+
     def _frame_signature(self, latest_frame: FrameData) -> str:
         try:
             return str(latest_frame.frame[-1])[:3500]
@@ -135,7 +216,8 @@ class MyAgent(Agent):
             return 0
 
     def _next_coord(self) -> tuple[int, int]:
-        coord = self.coord_candidates[self.coord_index % len(self.coord_candidates)]
+        pool = self.dynamic_coord_candidates if self.dynamic_coord_candidates else self.coord_candidates
+        coord = pool[self.coord_index % len(pool)]
         self.coord_index += 1
         return coord
 
@@ -232,14 +314,7 @@ class MyAgent(Agent):
         return signature, memory_key
 
     def _candidate_actions(self, ids: set[int]) -> list[GameAction]:
-        order = [
-            GameAction.ACTION1,
-            GameAction.ACTION2,
-            GameAction.ACTION3,
-            GameAction.ACTION4,
-            GameAction.ACTION5,
-            GameAction.ACTION7,
-        ]
+        order = [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION7]
         candidates = [a for a in order if self._is_available(a, ids)]
         if not candidates:
             candidates = [a for a in self.bootstrap_pattern if self._is_available(a, ids)]
@@ -317,28 +392,28 @@ class MyAgent(Agent):
     def _action_from_sequence_key(self, action_key: str) -> GameAction | None:
         return self._action_from_key(action_key)
 
-    def _sk48_policy(self, ids: set[int], memory_key: str) -> GameAction | None:
+    def _sk48_policy(self, latest_frame: FrameData, ids: set[int], memory_key: str) -> GameAction | None:
         if not str(self.game_id).startswith("sk48"):
             return None
 
-        # Periodically probe ACTION6 with structured coords, but do not spam it.
+        self._refresh_dynamic_coords(latest_frame)
+
+        # Probe ACTION6 more intelligently using visual centers when available.
         if self.action_counter > 0 and self.action_counter % self.sk48_probe_every == 0 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "sk48 branch probing ACTION6 coordinate based on offline diagnostics.",
+                "my_reason": "sk48 visual-pair branch probing ACTION6 coordinate.",
             }
             return action
 
-        # Deterministic structural pattern for sk48.
         candidate = self.sk48_plan[self.action_counter % len(self.sk48_plan)]
         if self._is_available(candidate, ids):
-            candidate.reasoning = f"sk48 structural policy picked {candidate.value}."
+            candidate.reasoning = f"sk48 visual structural policy picked {candidate.value}."
             return candidate
 
-        # If planned action unavailable, fallback to ranked generic action.
         ranked = self._rank_actions(ids, memory_key)
         if ranked:
             action = ranked[0]
@@ -362,7 +437,7 @@ class MyAgent(Agent):
         _, memory_key = self._register_previous_outcome(latest_frame)
         ids = self._available_action_ids(latest_frame)
 
-        sk48_action = self._sk48_policy(ids, memory_key)
+        sk48_action = self._sk48_policy(latest_frame, ids, memory_key)
         if sk48_action is not None:
             self._record_chosen_action(memory_key, sk48_action)
             return sk48_action
