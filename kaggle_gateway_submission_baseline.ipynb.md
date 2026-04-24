@@ -2,14 +2,15 @@
 
 Este notebook sigue el flujo correcto observado en el sample oficial.
 
-La versión actual usa un agente heurístico seguro:
+La versión actual usa un agente **online beam-like heuristic search**:
+- mantiene el flujo oficial del gateway
 - respeta `available_actions`
-- aprende qué acciones suelen cambiar el frame
-- penaliza acciones que no producen cambios
-- usa `ACTION6` con coordenadas estructuradas solo cuando conviene explorar
-- mantiene el flujo oficial del gateway sin generar manualmente el parquet durante el rerun
+- no genera manualmente `submission.parquet` durante el rerun
+- aprende qué acciones producen cambios observables
+- mantiene un pequeño beam de candidatas y elige entre las mejores con exploración controlada
+- usa `ACTION6` con coordenadas estructuradas ante estancamiento
 
-## Celda 1 — escribir agente custom heuristic solver
+## Celda 1 — escribir agente custom beam-like heuristic
 
 ```python
 %%writefile /kaggle/working/my_agent.py
@@ -22,17 +23,17 @@ from arcengine import FrameData, GameAction, GameState
 
 
 class MyAgent(Agent):
-    """Gateway-safe heuristic solver baseline.
+    """Gateway-safe online beam-like heuristic agent.
 
-    Este agente no accede a estado interno del entorno.
-    Trabaja únicamente con la interfaz pública del gateway:
-    - latest_frame
-    - available_actions
-    - niveles completados
-    - cambios de frame observables
+    No puede simular ramas reales desde el gateway, así que implementa un beam online:
+    - rankea acciones por evidencia histórica
+    - conserva top-k candidatas
+    - alterna explotación con exploración
+    - usa ACTION6 con coordenadas estructuradas cuando detecta estancamiento
     """
 
-    MAX_ACTIONS = 160
+    MAX_ACTIONS = 180
+    BEAM_WIDTH = 3
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -43,10 +44,12 @@ class MyAgent(Agent):
         self.last_action_key = None
         self.same_frame_count = 0
         self.best_score_seen = -1
+        self.last_score = 0
 
         self.action_scores: dict[str, float] = {}
         self.action_counts: dict[str, int] = {}
         self.action_nochange: dict[str, int] = {}
+        self.recent_actions: list[str] = []
 
         self.coord_index = 0
         self.coord_candidates = [
@@ -54,10 +57,13 @@ class MyAgent(Agent):
             (32, 32), (16, 16), (48, 48), (16, 48), (48, 16),
             (8, 8), (24, 24), (40, 40), (56, 56),
             (8, 56), (56, 8), (24, 40), (40, 24),
+            # coords observed / useful in sk48 diagnostics
             (13, 38), (22, 58), (11, 36), (20, 56),
+            # additional center-ish probes
+            (31, 31), (32, 31), (31, 32), (33, 33),
         ]
 
-        self.default_pattern = [
+        self.bootstrap_pattern = [
             GameAction.ACTION1,
             GameAction.ACTION2,
             GameAction.ACTION3,
@@ -66,11 +72,13 @@ class MyAgent(Agent):
             GameAction.ACTION4,
             GameAction.ACTION2,
             GameAction.ACTION3,
+            GameAction.ACTION5,
+            GameAction.ACTION7,
         ]
 
     @property
     def name(self) -> str:
-        return f"{super().name}.heuristic_solver.{self.MAX_ACTIONS}"
+        return f"{super().name}.online_beam.{self.MAX_ACTIONS}.k{self.BEAM_WIDTH}"
 
     def _available_action_ids(self, latest_frame: FrameData) -> set[int]:
         available = getattr(latest_frame, "available_actions", None)
@@ -95,10 +103,10 @@ class MyAgent(Agent):
 
     def _frame_signature(self, latest_frame: FrameData) -> str:
         try:
-            return str(latest_frame.frame[-1])[:2500]
+            return str(latest_frame.frame[-1])[:3000]
         except Exception:
             try:
-                return str(latest_frame.frame)[:2500]
+                return str(latest_frame.frame)[:3000]
             except Exception:
                 return "NO_FRAME"
 
@@ -126,6 +134,7 @@ class MyAgent(Agent):
         score_now = self._score_value(latest_frame)
 
         changed = self.last_signature is not None and signature != self.last_signature
+        score_delta = score_now - self.last_score
         score_improved = score_now > self.best_score_seen
 
         if self.last_action_key is not None:
@@ -135,11 +144,17 @@ class MyAgent(Agent):
             if changed:
                 delta += 1.0
             else:
-                delta -= 0.35
+                delta -= 0.45
                 self.action_nochange[self.last_action_key] = self.action_nochange.get(self.last_action_key, 0) + 1
 
-            if score_improved:
+            if score_delta > 0:
+                delta += 15.0 * score_delta
+            elif score_improved:
                 delta += 10.0
+
+            # discourage repeatedly trying the same thing when stuck
+            if self.same_frame_count >= 2:
+                delta -= 0.10
 
             self.action_scores[self.last_action_key] = self.action_scores.get(self.last_action_key, 0.0) + delta
 
@@ -149,28 +164,54 @@ class MyAgent(Agent):
             self.same_frame_count = 0
 
         self.last_signature = signature
+        self.last_score = score_now
         if score_now > self.best_score_seen:
             self.best_score_seen = score_now
 
-    def _rank_simple_actions(self, ids: set[int]) -> list[GameAction]:
-        candidates = []
-        for action in [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION7]:
-            if self._is_available(action, ids):
-                key = self._key_for_action(action)
-                score = self.action_scores.get(key, 0.0)
-                count = self.action_counts.get(key, 0)
-                nochange = self.action_nochange.get(key, 0)
-                exploration_bonus = 1.0 / (1.0 + count)
-                penalty = 0.15 * nochange
-                candidates.append((score + exploration_bonus - penalty, action))
-
+    def _candidate_actions(self, ids: set[int]) -> list[GameAction]:
+        order = [
+            GameAction.ACTION1,
+            GameAction.ACTION2,
+            GameAction.ACTION3,
+            GameAction.ACTION4,
+            GameAction.ACTION5,
+            GameAction.ACTION7,
+        ]
+        candidates = [a for a in order if self._is_available(a, ids)]
         if not candidates:
-            for action in self.default_pattern:
-                if self._is_available(action, ids):
-                    candidates.append((0.0, action))
+            candidates = [a for a in self.bootstrap_pattern if self._is_available(a, ids)]
+        return candidates
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return [a for _, a in candidates]
+    def _rank_actions(self, ids: set[int]) -> list[GameAction]:
+        ranked = []
+        for action in self._candidate_actions(ids):
+            key = self._key_for_action(action)
+            base_score = self.action_scores.get(key, 0.0)
+            count = self.action_counts.get(key, 0)
+            nochange = self.action_nochange.get(key, 0)
+
+            exploration_bonus = 1.25 / (1.0 + count)
+            nochange_penalty = 0.20 * nochange
+            repetition_penalty = 0.35 if self.recent_actions[-3:].count(key) >= 2 else 0.0
+
+            ranked.append((base_score + exploration_bonus - nochange_penalty - repetition_penalty, action))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return [a for _, a in ranked]
+
+    def _beam_pick(self, ranked: list[GameAction]) -> GameAction:
+        if not ranked:
+            return GameAction.RESET
+
+        beam = ranked[: self.BEAM_WIDTH]
+
+        # Mostly exploit the beam leader, sometimes explore within the beam.
+        r = random.random()
+        if r < 0.68:
+            return beam[0]
+        if r < 0.90:
+            return random.choice(beam)
+        return random.choice(ranked)
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return any([
@@ -187,33 +228,32 @@ class MyAgent(Agent):
         self._register_previous_outcome(latest_frame)
         ids = self._available_action_ids(latest_frame)
 
-        # Si estamos estancados, probar ACTION6 con coordenadas estructuradas si está disponible.
+        # Stagnation branch: probe complex coordinate action if allowed.
         if self.same_frame_count >= 2 and self._is_available(GameAction.ACTION6, ids):
             action = GameAction.ACTION6
             x, y = self._next_coord()
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {
                 "desired_action": f"{action.value}",
-                "my_reason": "Heuristic solver detected stagnation and is probing ACTION6 coordinates.",
+                "my_reason": "Online beam detected stagnation; probing structured ACTION6 coordinate.",
             }
             self.last_action_key = self._key_for_action(action)
+            self.recent_actions.append(self.last_action_key)
+            self.recent_actions = self.recent_actions[-10:]
             return action
 
-        ranked = self._rank_simple_actions(ids)
-        if ranked:
-            # Mezclar explotación y exploración para no casarse con una acción mediocre.
-            if random.random() < 0.78:
-                action = ranked[0]
-            else:
-                action = random.choice(ranked[: min(3, len(ranked))])
-            action.reasoning = f"Heuristic ranked action {action.value}"
-            self.last_action_key = self._key_for_action(action)
+        ranked = self._rank_actions(ids)
+        action = self._beam_pick(ranked)
+
+        if action is GameAction.RESET:
+            action.reasoning = "Fallback reset from empty beam."
+            self.last_action_key = None
             return action
 
-        # Fallback defensivo.
-        action = GameAction.RESET
-        action.reasoning = "No valid ranked actions; fallback reset."
-        self.last_action_key = None
+        action.reasoning = f"Online beam picked {action.value} from top-{self.BEAM_WIDTH} candidates."
+        self.last_action_key = self._key_for_action(action)
+        self.recent_actions.append(self.last_action_key)
+        self.recent_actions = self.recent_actions[-10:]
         return action
 ```
 
